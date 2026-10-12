@@ -1,0 +1,597 @@
+Fluidocell
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#050a16">
+<title>Fluido 3D</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{width:100%;height:100%;overflow:hidden;background:#050a16;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+    touch-action:none;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+  canvas{display:block;position:fixed;inset:0;}
+  #ov{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;text-align:center;padding:28px;
+    background:radial-gradient(circle at 50% 40%,#0e1a30,#050a16 78%);
+    color:#cfe6ff;transition:opacity .6s;}
+  #ov.hide{opacity:0;pointer-events:none;}
+  #ov h1{font-size:1.6rem;font-weight:600;letter-spacing:.16em;margin-bottom:16px;
+    background:linear-gradient(90deg,#4fc3ff,#8a7aff);-webkit-background-clip:text;
+    background-clip:text;color:transparent;}
+  #ov p{font-size:.9rem;line-height:1.6;opacity:.72;max-width:310px;}
+  #btn{margin-top:32px;padding:16px 48px;border-radius:999px;cursor:pointer;
+    border:1px solid rgba(80,180,255,.45);background:rgba(30,120,220,.2);
+    color:#b8e0ff;font-size:.95rem;letter-spacing:.18em;text-transform:uppercase;
+    font-family:inherit;transition:background .2s;}
+  #btn:active{background:rgba(60,160,255,.4);}
+  #hint{position:fixed;left:0;right:0;bottom:28px;text-align:center;color:#8fb8e0;
+    font-size:.8rem;letter-spacing:.08em;opacity:0;transition:opacity .8s;z-index:5;
+    pointer-events:none;text-shadow:0 1px 8px #000;padding:0 20px;}
+  #hint.show{opacity:.9;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint"></div>
+<div id="ov">
+  <h1>FLUIDO 3D</h1>
+  <p>Inclina il telefono per far muovere il liquido nella scatola a scacchiera.</p>
+  <button id="btn">Avvia</button>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ============================================================
+   CANVAS
+   ============================================================ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha:false });
+let W=0, H=0, DPR=1, cxs=0, cys=0;
+
+/* ============================================================
+   SCATOLA E CAMERA  (vista dall'alto, bordi = schermo)
+   ------------------------------------------------------------
+   Coordinate mondo:
+     +x → destra schermo
+     +z → giù schermo
+     +y → su (verso camera)
+   La faccia SUPERIORE della scatola (y = 0) riempie lo schermo.
+   La camera è a (0, CAM_H, 0) che guarda in basso.
+   ============================================================ */
+let BOX_HX = 1.0;          // semi-larghezza in x (fissa)
+let BOX_HZ = 1.0;          // semi-profondità in z (dipende dall'aspect)
+const BOX_DEPTH = 1.0;     // profondità in y (0 → -BOX_DEPTH)
+const CAM_H = 1.5;         // altezza camera sopra y=0
+let FOCAL = 600;           // lunghezza focale (ricalcolata al resize)
+
+// proiezione: punto mondo → pixel schermo
+function proj(x, y, z) {
+  const w = CAM_H - y;                 // profondità
+  return {
+    x: cxs + FOCAL * x / w,
+    y: cys + FOCAL * z / w,
+    w: w
+  };
+}
+
+/* ============================================================
+   RESIZE
+   ============================================================ */
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cxs = W * 0.5;
+  cys = H * 0.5;
+
+  // semi-profondità z per far combaciare la faccia top con lo schermo
+  BOX_HZ = H / W;
+  // focale: punto (1,0,0) → pixel (W, cys)
+  FOCAL = (W * 0.5) * CAM_H;
+
+  buildBackground();
+}
+window.addEventListener('resize', resize, { passive:true });
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+
+/* ============================================================
+   SFONDO PRECOMPUTATO (scatola a scacchiera)
+   ============================================================ */
+let bgCanvas = document.createElement('canvas');
+
+function buildBackground() {
+  bgCanvas.width  = canvas.width;
+  bgCanvas.height = canvas.height;
+  const bg = bgCanvas.getContext('2d');
+  bg.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  // sfondo
+  const g = bg.createRadialGradient(cxs, cys, 0, cxs, cys, Math.max(W,H)*0.8);
+  g.addColorStop(0, '#0a1424');
+  g.addColorStop(1, '#04060c');
+  bg.fillStyle = g;
+  bg.fillRect(0, 0, W, H);
+
+  // colori scacchiera
+  const COL_LIGHT = '#cbd6e8';
+  const COL_DARK  = '#2c4a78';
+  const COL_LIGHT_SH = '#9aabca';   // ombreggiatura (pareti)
+  const COL_DARK_SH  = '#1d3055';
+
+  function quad(p0, p1, p2, p3, fill) {
+    const a = proj(p0[0], p0[1], p0[2]);
+    const b = proj(p1[0], p1[1], p1[2]);
+    const c = proj(p2[0], p2[1], p2[2]);
+    const d = proj(p3[0], p3[1], p3[2]);
+    bg.beginPath();
+    bg.moveTo(a.x, a.y);
+    bg.lineTo(b.x, b.y);
+    bg.lineTo(c.x, c.y);
+    bg.lineTo(d.x, d.y);
+    bg.closePath();
+    bg.fillStyle = fill;
+    bg.fill();
+  }
+
+  /* ---------- FONDO (y = -BOX_DEPTH) ---------- */
+  const N = 12;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      const x0 = -BOX_HX + (i/N) * 2 * BOX_HX;
+      const x1 = -BOX_HX + ((i+1)/N) * 2 * BOX_HX;
+      const z0 = -BOX_HZ + (j/N) * 2 * BOX_HZ;
+      const z1 = -BOX_HZ + ((j+1)/N) * 2 * BOX_HZ;
+      const col = ((i+j) & 1) ? COL_DARK : COL_LIGHT;
+      quad(
+        [x0, -BOX_DEPTH, z0],
+        [x1, -BOX_DEPTH, z0],
+        [x1, -BOX_DEPTH, z1],
+        [x0, -BOX_DEPTH, z1],
+        col
+      );
+    }
+  }
+
+  /* ---------- PARETI INTERNE ---------- */
+  // +x (x = BOX_HX)  e  -x (x = -BOX_HX)
+  for (let s of [-1, 1]) {
+    const xWall = s * BOX_HX;
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < 6; j++) {
+        const z0 = -BOX_HZ + (i/N) * 2 * BOX_HZ;
+        const z1 = -BOX_HZ + ((i+1)/N) * 2 * BOX_HZ;
+        const y0 = -BOX_DEPTH + (j/6) * BOX_DEPTH;
+        const y1 = -BOX_DEPTH + ((j+1)/6) * BOX_DEPTH;
+        const t = 1 - (j/6); // 1 = top, 0 = bottom
+        const light = ((i+j) & 1) === 0;
+        const col = light
+          ? mix(COL_LIGHT_SH, COL_LIGHT, t)
+          : mix(COL_DARK_SH,  COL_DARK,  t);
+        // attenzione all'ordine dei vertici per avere il "davanti" coerente
+        if (s === 1) {
+          quad([xWall,y0,z0],[xWall,y0,z1],[xWall,y1,z1],[xWall,y1,z0], col);
+        } else {
+          quad([xWall,y0,z1],[xWall,y0,z0],[xWall,y1,z0],[xWall,y1,z1], col);
+        }
+      }
+    }
+  }
+  // +z (z = BOX_HZ) e -z (z = -BOX_HZ)
+  for (let s of [-1, 1]) {
+    const zWall = s * BOX_HZ;
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < 6; j++) {
+        const x0 = -BOX_HX + (i/N) * 2 * BOX_HX;
+        const x1 = -BOX_HX + ((i+1)/N) * 2 * BOX_HX;
+        const y0 = -BOX_DEPTH + (j/6) * BOX_DEPTH;
+        const y1 = -BOX_DEPTH + ((j+1)/6) * BOX_DEPTH;
+        const t = 1 - (j/6);
+        const light = ((i+j) & 1) === 0;
+        const col = light
+          ? mix(COL_LIGHT_SH, COL_LIGHT, t)
+          : mix(COL_DARK_SH,  COL_DARK,  t);
+        if (s === 1) {
+          quad([x0,y0,zWall],[x1,y0,zWall],[x1,y1,zWall],[x0,y1,zWall], col);
+        } else {
+          quad([x1,y0,zWall],[x0,y0,zWall],[x0,y1,zWall],[x1,y1,zWall], col);
+        }
+      }
+    }
+  }
+
+  /* ---------- BORDO SUPERIORE (cornice) ---------- */
+  bg.lineWidth = 3;
+  bg.strokeStyle = 'rgba(150,200,255,0.55)';
+  bg.beginPath();
+  const c1 = proj(-BOX_HX, 0, -BOX_HZ);
+  const c2 = proj( BOX_HX, 0, -BOX_HZ);
+  const c3 = proj( BOX_HX, 0,  BOX_HZ);
+  const c4 = proj(-BOX_HX, 0,  BOX_HZ);
+  bg.moveTo(c1.x, c1.y);
+  bg.lineTo(c2.x, c2.y);
+  bg.lineTo(c3.x, c3.y);
+  bg.lineTo(c4.x, c4.y);
+  bg.closePath();
+  bg.stroke();
+}
+
+function mix(hexA, hexB, t) {
+  const a = parseInt(hexA.slice(1), 16);
+  const b = parseInt(hexB.slice(1), 16);
+  const ar = (a>>16)&255, ag = (a>>8)&255, ab = a&255;
+  const br = (b>>16)&255, bg2 = (b>>8)&255, bb = b&255;
+  const r = Math.round(ar + (br-ar)*t);
+  const g = Math.round(ag + (bg2-ag)*t);
+  const bl = Math.round(ab + (bb-ab)*t);
+  return 'rgb('+r+','+g+','+bl+')';
+}
+
+/* ============================================================
+   FLUIDO
+   ============================================================ */
+const N_PART = 700;
+const H_R = 0.22;                 // raggio di interazione
+const H_R2 = H_R * H_R;
+const K_REP = 55.0;               // repulsione
+const K_VISC = 0.45;              // viscosità
+const DAMP = 0.988;
+const GRAV = 9.5;
+const MAX_V = 5.5;
+const P_RADIUS = 0.075;           // raggio particella (per pareti + rendering)
+
+const px = new Float32Array(N_PART);
+const py = new Float32Array(N_PART);
+const pz = new Float32Array(N_PART);
+const vx = new Float32Array(N_PART);
+const vy = new Float32Array(N_PART);
+const vz = new Float32Array(N_PART);
+const ax_ = new Float32Array(N_PART);
+const ay_ = new Float32Array(N_PART);
+const az_ = new Float32Array(N_PART);
+
+function initFluid() {
+  // distribuisce le particelle nella metà inferiore della scatola
+  let i = 0;
+  const colsX = 10;
+  const colsZ = Math.max(6, Math.round(10 * BOX_HZ / BOX_HX));
+  const colsY = Math.max(3, Math.floor(N_PART / (colsX * colsZ)));
+  const dx = (2 * BOX_HX * 0.9) / colsX;
+  const dz = (2 * BOX_HZ * 0.9) / colsZ;
+  const dy = (BOX_DEPTH * 0.5) / colsY;
+
+  for (let iy = 0; iy < colsY && i < N_PART; iy++) {
+    for (let ix = 0; ix < colsX && i < N_PART; ix++) {
+      for (let iz = 0; iz < colsZ && i < N_PART; iz++) {
+        px[i] = -BOX_HX * 0.9 + (ix + 0.5) * dx + (Math.random()-0.5) * dx*0.3;
+        py[i] = -BOX_DEPTH * 0.95 + (iy + 0.5) * dy + (Math.random()-0.5) * dy*0.3;
+        pz[i] = -BOX_HZ * 0.9 + (iz + 0.5) * dz + (Math.random()-0.5) * dz*0.3;
+        i++;
+      }
+    }
+  }
+  // se ne mancano, li metto in giro
+  while (i < N_PART) {
+    px[i] = (Math.random()*2-1) * BOX_HX * 0.9;
+    py[i] = -BOX_DEPTH + Math.random() * BOX_DEPTH * 0.6;
+    pz[i] = (Math.random()*2-1) * BOX_HZ * 0.9;
+    i++;
+  }
+}
+
+/* ============================================================
+   SPATIAL GRID
+   ============================================================ */
+const GRID_N = 10;
+let CELL_X = 1, CELL_Y = 1, CELL_Z = 1;
+let NUM_CELLS = 1;
+let cellStart = null, cellCount = null, cellPtr = null, cellList = null, cellOf = null;
+
+function buildGrid() {
+  CELL_X = (2 * BOX_HX) / GRID_N;
+  CELL_Y = BOX_DEPTH / GRID_N;
+  CELL_Z = (2 * BOX_HZ) / GRID_N;
+  NUM_CELLS = GRID_N * GRID_N * GRID_N;
+
+  if (!cellStart) {
+    cellStart = new Int32Array(NUM_CELLS + 1);
+    cellCount = new Int32Array(NUM_CELLS);
+    cellPtr   = new Int32Array(NUM_CELLS);
+    cellList  = new Int32Array(N_PART);
+    cellOf    = new Int32Array(N_PART);
+  }
+
+  cellCount.fill(0);
+  for (let i = 0; i < N_PART; i++) {
+    let ix = Math.floor((px[i] + BOX_HX) / CELL_X);
+    let iy = Math.floor((-py[i]) / CELL_Y);
+    let iz = Math.floor((pz[i] + BOX_HZ) / CELL_Z);
+    if (ix < 0) ix = 0; else if (ix >= GRID_N) ix = GRID_N-1;
+    if (iy < 0) iy = 0; else if (iy >= GRID_N) iy = GRID_N-1;
+    if (iz < 0) iz = 0; else if (iz >= GRID_N) iz = GRID_N-1;
+    const ci = ix + iy*GRID_N + iz*GRID_N*GRID_N;
+    cellOf[i] = ci;
+    cellCount[ci]++;
+  }
+  let acc = 0;
+  for (let c = 0; c < NUM_CELLS; c++) { cellStart[c] = acc; acc += cellCount[c]; }
+  cellStart[NUM_CELLS] = acc;
+  for (let c = 0; c < NUM_CELLS; c++) cellPtr[c] = cellStart[c];
+  for (let i = 0; i < N_PART; i++) {
+    const ci = cellOf[i];
+    cellList[cellPtr[ci]++] = i;
+  }
+}
+
+/* ============================================================
+   SENSORI
+   ============================================================ */
+let gx = 0, gy = -GRAV, gz = 0;
+let targetGx = 0, targetGy = -GRAV, targetGz = 0;
+let sensorWorking = false;
+
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  sensorWorking = true;
+
+  // Mappatura: accelerometro (device) → gravità (box)
+  //  device +x → box +x           (destra)
+  //  device +y → box -z           (su schermo = -z)
+  //  device +z → box +y           (fuori schermo = su)
+  //  gravità_device = -accel
+  //  gravità_box    = (-accel.x, -accel.z, +accel.y)
+  targetGx = -a.x;
+  targetGy = -a.z;
+  targetGz =  a.y;
+
+  // normalizza a GRAV
+  const m = Math.hypot(targetGx, targetGy, targetGz);
+  if (m > 0.5) {
+    const k = GRAV / m;
+    targetGx *= k;
+    targetGy *= k;
+    targetGz *= k;
+  }
+}
+
+function onOrient(e) {
+  if (sensorWorking) return;
+  if (e.beta == null || e.gamma == null) return;
+
+  // fallback usando beta/gamma (deviceorientation)
+  //  beta: inclinazione avanti/indietro (0 = piatto)
+  //  gamma: inclinazione laterale (0 = piatto)
+  const b = e.beta  * Math.PI / 180;
+  const g = e.gamma * Math.PI / 180;
+
+  // Approssimazione: quando beta cresce (top del telefono in giù),
+  // la gravità tira verso l'alto dello schermo (-z nel box).
+  targetGx =  Math.sin(g) * GRAV;
+  targetGy = -Math.cos(b) * Math.cos(g) * GRAV;
+  targetGz = -Math.sin(b) * GRAV;
+
+  sensorWorking = true;
+}
+
+/* ============================================================
+   STEP FISICO
+   ============================================================ */
+function physicsStep(dt) {
+  // Smoothing gravità
+  const s = 0.15;
+  gx += (targetGx - gx) * s;
+  gy += (targetGy - gy) * s;
+  gz += (targetGz - gz) * s;
+
+  // reset forze
+  for (let i = 0; i < N_PART; i++) {
+    ax_[i] = gx;
+    ay_[i] = gy;
+    az_[i] = gz;
+  }
+
+  buildGrid();
+
+  // Forze tra vicini
+  for (let i = 0; i < N_PART; i++) {
+    const ci = cellOf[i];
+    const cix = ci % GRID_N;
+    const ciy = ((ci / GRID_N) | 0) % GRID_N;
+    const ciz = (ci / (GRID_N*GRID_N)) | 0;
+
+    const xi = px[i], yi = py[i], zi = pz[i];
+    const vxi = vx[i], vyi = vy[i], vzi = vz[i];
+
+    for (let dx = -1; dx <= 1; dx++) {
+      const nx = cix + dx; if (nx < 0 || nx >= GRID_N) continue;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = ciy + dy; if (ny < 0 || ny >= GRID_N) continue;
+        for (let dz = -1; dz <= 1; dz++) {
+          const nz = ciz + dz; if (nz < 0 || nz >= GRID_N) continue;
+          const nc = nx + ny*GRID_N + nz*GRID_N*GRID_N;
+          const s0 = cellStart[nc], s1 = cellStart[nc+1];
+          for (let k = s0; k < s1; k++) {
+            const j = cellList[k];
+            if (j <= i) continue;   // coppia una volta sola
+            const ddx = px[j] - xi;
+            const ddy = py[j] - yi;
+            const ddz = pz[j] - zi;
+            const d2 = ddx*ddx + ddy*ddy + ddz*ddz;
+            if (d2 > H_R2 || d2 < 1e-8) continue;
+
+            const d = Math.sqrt(d2);
+            const inv = 1/d;
+            const ux = ddx * inv;
+            const uy = ddy * inv;
+            const uz = ddz * inv;
+
+            // Repulsione
+            const rep = K_REP * (H_R - d);
+            ax_[i] -= ux * rep; ay_[i] -= uy * rep; az_[i] -= uz * rep;
+            ax_[j] += ux * rep; ay_[j] += uy * rep; az_[j] += uz * rep;
+
+            // Viscosità
+            const dvx = vx[j] - vxi;
+            const dvy = vy[j] - vyi;
+            const dvz = vz[j] - vzi;
+            const dot = dvx*ux + dvy*uy + dvz*uz;
+            if (dot < 0) {
+              const v = K_VISC * (H_R - d) * dot;
+              ax_[i] += ux * v; ay_[i] += uy * v; az_[i] += uz * v;
+              ax_[j] -= ux * v; ay_[j] -= uy * v; az_[j] -= uz * v;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Integrazione + collisioni
+  const limX = BOX_HX - P_RADIUS;
+  const limYlo = -BOX_DEPTH + P_RADIUS;
+  const limYhi = -P_RADIUS;                 // top aperto (y=0), ma teniamo dentro
+  const limZ = BOX_HZ - P_RADIUS;
+
+  for (let i = 0; i < N_PART; i++) {
+    vx[i] = (vx[i] + ax_[i] * dt) * DAMP;
+    vy[i] = (vy[i] + ay_[i] * dt) * DAMP;
+    vz[i] = (vz[i] + az_[i] * dt) * DAMP;
+
+    // clamp velocità
+    const sp2 = vx[i]*vx[i] + vy[i]*vy[i] + vz[i]*vz[i];
+    if (sp2 > MAX_V*MAX_V) {
+      const k = MAX_V / Math.sqrt(sp2);
+      vx[i] *= k; vy[i] *= k; vz[i] *= k;
+    }
+
+    px[i] += vx[i] * dt;
+    py[i] += vy[i] * dt;
+    pz[i] += vz[i] * dt;
+
+    // Pareti
+    if (px[i] < -limX) { px[i] = -limX; if (vx[i] < 0) vx[i] *= -0.15; }
+    else if (px[i] > limX) { px[i] = limX; if (vx[i] > 0) vx[i] *= -0.15; }
+    if (pz[i] < -limZ) { pz[i] = -limZ; if (vz[i] < 0) vz[i] *= -0.15; }
+    else if (pz[i] > limZ) { pz[i] = limZ; if (vz[i] > 0) vz[i] *= -0.15; }
+    if (py[i] < limYlo) { py[i] = limYlo; if (vy[i] < 0) vy[i] *= -0.15; }
+    else if (py[i] > limYhi) { py[i] = limYhi; if (vy[i] > 0) vy[i] *= -0.15; }
+  }
+}
+
+/* ============================================================
+   SPRITE PARTICELLA
+   ============================================================ */
+const SPR = 64;
+const sprite = document.createElement('canvas');
+sprite.width = sprite.height = SPR;
+(function(){
+  const g = sprite.getContext('2d');
+  const grd = g.createRadialGradient(SPR/2, SPR/2, 0, SPR/2, SPR/2, SPR/2);
+  grd.addColorStop(0.00, 'rgba(235,252,255,1)');
+  grd.addColorStop(0.18, 'rgba(150,235,255,0.92)');
+  grd.addColorStop(0.45, 'rgba(50,170,255,0.45)');
+  grd.addColorStop(1.00, 'rgba(10,50,130,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, SPR, SPR);
+})();
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  // sfondo precomputato
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+
+  // fluido (additivo)
+  ctx.globalCompositeOperation = 'lighter';
+
+  const margin = 64;
+  for (let i = 0; i < N_PART; i++) {
+    const p = proj(px[i], py[i], pz[i]);
+    if (p.w < 0.3) continue;
+    const r = FOCAL * P_RADIUS / p.w;
+    if (r < 0.5) continue;
+    if (p.x + r < -margin || p.x - r > W + margin) continue;
+    if (p.y + r < -margin || p.y - r > H + margin) continue;
+    // leggera diminuzione di luminosità con la profondità
+    const fade = Math.min(1, 1.1 - p.w * 0.06);
+    ctx.globalAlpha = Math.max(0.35, Math.min(0.95, fade));
+    ctx.drawImage(sprite, p.x - r, p.y - r, r*2, r*2);
+  }
+
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+
+  // ricornice del bordo superiore (sopra il fluido)
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(170,220,255,0.6)';
+  ctx.beginPath();
+  const c1 = proj(-BOX_HX, 0, -BOX_HZ);
+  const c2 = proj( BOX_HX, 0, -BOX_HZ);
+  const c3 = proj( BOX_HX, 0,  BOX_HZ);
+  const c4 = proj(-BOX_HX, 0,  BOX_HZ);
+  ctx.moveTo(c1.x, c1.y);
+  ctx.lineTo(c2.x, c2.y);
+  ctx.lineTo(c3.x, c3.y);
+  ctx.lineTo(c4.x, c4.y);
+  ctx.closePath();
+  ctx.stroke();
+}
+
+/* ============================================================
+   LOOP
+   ============================================================ */
+let lastT = performance.now();
+let acc_ = 0;
+const FIXED = 1/60;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  let dtReal = (now - lastT) / 1000;
+  lastT = now;
+  if (dtReal > 0.1) dtReal = 0.1;
+  acc_ += dtReal;
+
+  let iter = 0;
+  while (acc_ >= FIXED && iter < 3) {
+    physicsStep(FIXED);
+    acc_ -= FIXED;
+    iter++;
+  }
+  if (iter >= 3) acc_ = 0;
+
+  render();
+}
+
+/* ============================================================
+   AVVIO + PERMESSI SENSORI
+   ============================================================ */
+const ov = document.getElementById('ov');
+const hint = document.getElementById('hint');
+let started = false;
+
+function attachMotion() {
+  window.addEventListener('devicemotion', onMotion, false);
+  window.addEventListener('deviceorientation', onOrient, false);
+}
+
+function start() {
+  if (started) return;
+  started = true;
+  ov.classList.add('hide');
+
+  // init del fluido ORA che BOX_HZ è definitivo
+  initFluid();
